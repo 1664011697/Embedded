@@ -12,7 +12,7 @@ static fingerprint_finger_id_t *fids = NULL;
 static int n_fids = -1;
 static const fingerprint_module_t *fp_module_p=NULL;
 static volatile bool change_flag=false;
-static int auth_flag=4;
+static int auth_flag=8;
 static Mode_t run_mode = WAIT_MODE;
 static inline int fingerprint_open(const fingerprint_module_t* module,
                                    fingerprint_device_t** device) {
@@ -91,34 +91,26 @@ const char * str_hal_acquired_info(fingerprint_acquired_info_t info)
 }
 void authFlag_reset()
 {
-    auth_flag=4;
+    auth_flag=6;
 }
+void fp_close();
+static bool cancel_flag=false;
 int fp_cancel()
 {
     int ret = 0;
-    if((run_mode == WAIT_MODE) || (run_mode == CLEAR_MODE))
+    if((run_mode != WAIT_MODE))
     {
+        pthread_cond_signal(&cond);
+        cancel_flag=true;
         while(run_mode != WAIT_MODE);
+        out("change success\n");
         return 1;
     }
-    if(need_cancel)
-    {
-        ret = device_p->cancel(device_p);
-        need_cancel = false;
-    }
-    if (ret)
-    {
-        out("\n Failed to cancel %d (%s)\n", ret, strerror(ret));
-        return -1;
-    }
-    out("mode switching...\n");
-    while(run_mode != WAIT_MODE);
-    out("mode switch success!...\n");
-    return 1;
+    return -1;
 }
 bool necessaryTo_switch()
 {
-    return !((run_mode == WAIT_MODE) || (run_mode == CLEAR_MODE)); 
+    return run_mode != WAIT_MODE;
 }
 Mode_t currMode_get()
 {
@@ -140,8 +132,12 @@ static void fingerprint_notify(const fingerprint_msg_t *msg)
             Send_commond(FINGERPRINT_AUTH_ERROR);
             if(run_mode == AUTH_MODE)
             {
+                out("auth_mode.flag:%u\n",auth_flag);
                 if(auth_flag) --auth_flag;
-                else device_p->cancel(device_p);
+                if(auth_flag == 0){
+                    pthread_cond_signal(&cond);
+                    out("cancel.\n");
+                }
             }
         }
         break;
@@ -152,13 +148,22 @@ static void fingerprint_notify(const fingerprint_msg_t *msg)
               msg->data.authenticated.finger.gid);
         if (msg->data.authenticated.finger.fid != 0) 
         {
-            pthread_mutex_lock(&lock);
             pthread_cond_signal(&cond);
-            pthread_mutex_unlock(&lock);
             Send_commond(FINGERPRINT_AUTH_FINISH);
         }
         else
+        {
+            out("one image.\n");
+
             Send_commond(FINGERPRINT_AUTH_ERROR);
+            out("auth_mode.flag:%u\n",auth_flag);
+            if(auth_flag) --auth_flag;
+            if(auth_flag == 0){
+                pthread_cond_signal(&cond);
+                out("cancel.\n");
+            }
+            //Send_commond(FINGERPRINT_AUTH_ERROR);
+        }
         break;
 
     case FINGERPRINT_TEMPLATE_ENROLLING:
@@ -171,6 +176,7 @@ static void fingerprint_notify(const fingerprint_msg_t *msg)
             pthread_mutex_lock(&lock);
             pthread_cond_signal(&cond);
             pthread_mutex_unlock(&lock);
+            Send_commond(FINGERPRINT_ENROLL_FINISH);
         }
         else
         {
@@ -208,12 +214,39 @@ const char * str_halerror(fingerprint_error_t err)
         return "UNKOWN";
     }
 }
+void handle_signal(int __unused signal)
+{
+    int s = 0;
+
+    if (need_cancel) {
+        s = device_p->cancel(device_p);
+        if (s)
+            out("Failed to cancel %d (%s)\n", s, strerror(s));
+    }
+    fingerprint_close(device_p);
+    out("close success\n");
+    exit(s);
+}
+void fp_spi_init()
+{
+    inv_spi_init();
+}
+void fp_close()
+{
+    if(need_cancel)
+    {
+        out("need_cancel..before.\n");
+        device_p->cancel(device_p);
+        need_cancel=false;
+        out("need_cancel..end.\n");
+    }
+    if(!cancel_flag)
+        pthread_cond_signal(&cond);
+    fingerprint_close(device_p);
+}
 int fingerprint_init(char *fp_lib)
 {
     int ret;
-    ret = inv_spi_init();
-    if (ret < 0)
-        return -1;
     /* Init test */
     if (fp_lib != NULL)
         ret = fingerprint_load(&fp_module_p, fp_lib);
@@ -256,6 +289,18 @@ int fingerprint_init(char *fp_lib)
         out("\nFailed to do init\n");
         goto exit;
     }
+    /*
+       struct sigaction sa = {
+       .sa_handler = &handle_signal,
+       };
+       sigfillset(&sa.sa_mask);
+       if (sigaction(SIGINT, &sa, NULL) == -1) {
+       perror("Error: cannot handle SIGINT"); // Should not happen
+       }
+       if (sigaction(SIGQUIT, &sa, NULL) == -1) {
+       perror("Error: cannot handle SIGQUIT"); // Should not happen
+       }
+       */
     return 1;
 exit:
     exit(-1);
@@ -286,6 +331,7 @@ void fingerprint_enroll()
     }
 
     out("\nFingerprint enroll: start\n");
+    need_cancel = true;
     ret = device_p->enroll(device_p, &hat, gid, timeout ? timeout : 600); /* 10 min. time-out */
     if (ret)
     {
@@ -298,6 +344,7 @@ void fingerprint_enroll()
     pthread_mutex_lock(&lock);
     ret = pthread_cond_timedwait(&cond, &lock, &ts);
     pthread_mutex_unlock(&lock);
+    out("end.\n");
     if (ret)
     {
         int s;
@@ -307,12 +354,12 @@ void fingerprint_enroll()
         if (s)
             out("\n Failed to cancel %d (%s)\n", s, strerror(s));
         run_mode = WAIT_MODE;
-        return ;
+        goto exit;
     }
     else if (fp_error)
     {
         out("\n Failed to enroll - error reported by HAL %d (%s)\n", fp_error, str_halerror(fp_error));
-        return ;
+        goto exit;
     }
     out("\n Fingerprint enroll: all captures done\n");
     ret=device_p->post_enroll(device_p);
@@ -321,11 +368,10 @@ void fingerprint_enroll()
         out("\n Failed to end enrollment\n");
         goto exit;
     }
-    Send_commond(FINGERPRINT_ENROLL_FINISH);
     run_mode = WAIT_MODE;
     return;
 exit:
-    exit(-1);
+    return;
 }
 void fingerprint_clear()
 {
@@ -382,7 +428,7 @@ void fingerprint_auth()
         out("Error reported by HAL before authenticate: %d (%s)\n", fp_error, str_halerror(fp_error));
         goto exit;
     }
-
+    out("auth begin.\n");
     ret = device_p->authenticate(device_p, 0, gid);
     if (ret) {
         out("\n Failed to start authentication\n");
@@ -394,7 +440,9 @@ void fingerprint_auth()
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += (timeout ? timeout : 2*60);
     pthread_mutex_lock(&lock);
+    out("begin\n");
     ret = pthread_cond_timedwait(&cond, &lock, &ts);
+    out("end.\n");
     pthread_mutex_unlock(&lock);
     if (ret)
     {
@@ -411,11 +459,11 @@ void fingerprint_auth()
         out("Failed to authenticate - error sent from HAL %d\n", fp_error);
         goto exit;
     }
-    authFlag_reset();
     out("\n Fingerprint authenticate: Success!!!\n");
+    run_mode = WAIT_MODE;
     return ;
 exit:
-    authFlag_reset();
+    run_mode = WAIT_MODE;
     return;
 
 }

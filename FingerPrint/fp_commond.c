@@ -7,6 +7,7 @@ static SpiMsg_t response_msg;
 static const char *device = "/dev/spidev2.0";
 static uint8_t *pType=NULL;
 static struct spi_ioc_transfer tr;
+static int delay_flag=2;
 uint8_t Recv_commond()
 {
     return receive_msg._type;
@@ -49,13 +50,19 @@ void Transfer()
         pabort("can't send spi message");
         return ;
     }
+    if(delay_flag) --delay_flag;
+    else
+    {
+        response_msg._type = FINGERPRINT_ACQUIRED_NONE;
+        delay_flag=2;
+    }
     spiRx_unpacket();
 }
 void Spi_init()
 {
-    unsigned char mode,bits;
-    int speed=5000000;
-    int fd=-1,ret;
+    unsigned char mode=0,bits=8;
+    int speed=4000000;
+    int ret;
     fd = open(device, O_RDWR);
     if (fd < 0)
         pabort("can't open device");
